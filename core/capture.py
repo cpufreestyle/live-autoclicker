@@ -158,6 +158,21 @@ def point_owned_by_session(hwnd: int, x: int, y: int) -> bool:
     return area > 0 and ix * iy >= 0.8 * area
 
 
+def window_alive(hwnd: int) -> bool:
+    """窗口句柄还有效吗（没被关掉）。
+
+    从截图到点击隔着几次 OCR（可能一两秒），这期间用户可能把直播间关了。
+    窗口一没，原来记下的矩形就只是屏幕上一段旧坐标：这时候照旧点下去，点中的
+    是桌面或者正好飘到那儿的别的窗口。点击前花一次 IsWindow 的代价把它堵死。
+    """
+    if not hwnd or not hasattr(ctypes, "windll"):
+        return True
+    try:
+        return bool(ctypes.windll.user32.IsWindow(wintypes.HWND(int(hwnd))))
+    except Exception:
+        return True
+
+
 def is_minimized(hwnd: int) -> bool:
     """窗口是不是缩在任务栏里（最小化）。"""
     if not hwnd or not hasattr(ctypes, "windll"):

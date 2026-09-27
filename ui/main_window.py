@@ -11,7 +11,7 @@ from tkinter import ttk, messagebox
 from typing import Callable
 
 from core.capture import ScreenCapture, root_hwnd, set_process_dpi_awareness
-from core.config import (BASE_DIR, ConfigError, Monitor, Settings, Target, abs_path, changed_config_files, config_files,
+from core.config import (BASE_DIR, OCR_PROVIDER_CHOICES, ConfigError, Monitor, Settings, Target, abs_path, changed_config_files, config_files,
                          load_monitors, load_settings, load_targets, save_monitors,
                          save_settings, save_targets, unique_name)
 from core.detector import CooldownTracker, Detector, resolve_region
@@ -321,7 +321,18 @@ class MainWindow:
         self._hint(box, "很卡就把 OCR 线程降到 1~2、并发保持 1；小窗口字太小就调大放大边。\n"
                         "「OCR 每几轮」设 2 省一半 OCR，代价是最坏多等一个间隔。\n"
                         "「空闲降频」：连续这么多轮什么都没扫到时，OCR 改成每这么多轮才跑一次，"
-                        "一有命中立刻恢复；直播没弹窗的白等时段能省一半以上 CPU。")
+                        "一有命中立刻恢复；直播没弹窗的白等时段能省一半以上 CPU。\n"
+                        "「OCR 后端」：auto=有独显就用（DirectML，真机快约一倍），"
+                        "cpu=只用 CPU，directml=强制显卡、起不来自动退回 CPU。"
+                        "推理会话建好就换不了，改完要先停止再启动。")
+        self._row += 1
+        ttk.Label(box, text="OCR 后端").grid(row=self._row, column=0, sticky="w")
+        self.vars["ocr_provider"] = tk.StringVar()
+        provider = ttk.Combobox(box, textvariable=self.vars["ocr_provider"], width=8,
+                                state="readonly", values=list(OCR_PROVIDER_CHOICES))
+        provider.grid(row=self._row, column=1, sticky="w", padx=(self._px(10), 0))
+        provider.bind("<<ComboboxSelected>>", lambda e: self._apply_settings())
+        ttk.Label(box, text="改了要重启生效").grid(row=self._row, column=2, sticky="e")
 
         self._section(box, "点击与启动")
         self._row += 1
@@ -432,6 +443,7 @@ class MainWindow:
         self.vars["ocr_min_side"].set(self.settings.ocr_min_side)
         self.vars["ocr_scan_every"].set(self.settings.ocr_scan_every)
         self.vars["ocr_idle_every"].set(self.settings.ocr_idle_every)
+        self.vars["ocr_provider"].set(self.settings.ocr_provider)
         self.vars["click_guard_sec"].set(self.settings.click_guard_sec)
         self.vars["use_pydirectinput"].set(self.settings.use_pydirectinput)
         self.vars["humanize_click"].set(self.settings.humanize_click)
@@ -712,6 +724,10 @@ class MainWindow:
         self.settings.ocr_min_side = self._int_var("ocr_min_side", self.settings.ocr_min_side, 0, 4096)
         self.settings.ocr_scan_every = self._int_var("ocr_scan_every", self.settings.ocr_scan_every, 1, 10)
         self.settings.ocr_idle_every = self._int_var("ocr_idle_every", self.settings.ocr_idle_every, 1, 10)
+        provider = str(self.vars["ocr_provider"].get() or "").strip().lower()
+        self.settings.ocr_provider = (provider if provider in OCR_PROVIDER_CHOICES
+                                      else {"gpu": "directml", "dml": "directml"}
+                                      .get(provider, "auto"))
         self.settings.click_guard_sec = self._float_var("click_guard_sec",
                                                      self.settings.click_guard_sec, 0.0, 60.0)
         self.settings.use_pydirectinput = bool(self.vars["use_pydirectinput"].get())
@@ -743,7 +759,8 @@ class MainWindow:
     def toggle_run(self, silent: bool = False) -> None:
         if not self.engine.running and not self._validate_for_start(silent):
             return
-        self.engine.toggle()
+        # 异步停止：同步 join 扫描线程最长 5s（卡在长帧 OCR 上），会把 tkinter 主线程一起拖住，界面像卡死
+        self.engine.toggle(wait=False)
 
     def _validate_for_start(self, silent: bool = False) -> bool:
         """启动前的配置检查。自动启动时只写日志，不弹模态框。"""

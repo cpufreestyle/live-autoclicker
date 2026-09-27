@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from core.capture import (ScreenCapture, WindowLocator, bring_to_front, frame_changed,
                           drop_topmost, frame_digest, grab_window, is_minimized, looks_blank,
 window_identity_at, point_on_screen, move_window_into_view, restore_window_position,
-                          point_owned_by_session, window_rect_for)
+                          point_owned_by_session, window_alive, window_rect_for)
 import core.capture as capture_mod
 from core.clicker import Clicker
 from core.config import Monitor, Settings, Target
@@ -157,6 +157,9 @@ class MonitorWorker(threading.Thread):
                             self.state.last_error = ""
                             self._skips_static += 1
                         else:
+                            # 「刚点完要补一次识别」只在这一刻用掉：上面整轮跳过的
+                            # 情况不许消耗它，否则弹窗没被点掉时就少了一次确认的机会
+                            self._ocr_force = False
                             self.engine.process_frame(self, frame)
                             self.state.last_error = ""
                 except Exception as exc:
@@ -347,16 +350,17 @@ class MonitorWorker(threading.Thread):
         绝大多数时间没有弹窗，那段 OCR 是白烧 CPU。代价是弹窗最坏晚一个扫描间隔
         被点到：会一直挂到被点掉的弹窗没损失，但自己几秒就消失的弹窗（红包倒计时
         之类）可能整轮错过，那种场景把 `ocr_idle_every` 填 1。刚点完一发则强制跑
-        一次完整 OCR，好尽快确认弹窗已经消失。
-        好尽快确认弹窗已经消失。
+        一次完整 OCR，好尽快确认弹窗已经消失。那个标记只在这里「看」，真正清掉
+        要等这一轮真的扫上（见 run() 里的 `_ocr_force = False`）：点完那一发若
+        刚好被判成「画面没变」整轮跳过，标记必须留着，否则确认用的那次 OCR 就
+        白没了。
         """
-        if self._ocr_force:
-            self._ocr_force = False
-            self._ocr_since = 0
-            return True
         every = max(1, int(self.engine.settings.ocr_scan_every))
         idle_every = max(every, int(getattr(self.engine.settings, "ocr_idle_every", every)))
         cadence = idle_every if self._idle_rounds >= idle_every else every
+        if self._ocr_force:
+            self._ocr_since = 0
+            return True
         self._ocr_since += 1
         if self._ocr_since < cadence:
             return False
@@ -468,6 +472,11 @@ class Engine:
         self.clicker = self._make_clicker(settings)
         self._clicker_cfg = self._clicker_config(settings)
         self._workers: dict[str, MonitorWorker] = {}
+        # 已劝停、还没确认退干净的线程 [(worker, 退出截止时间)]：异步停止时后台收拾用，
+        # 启动前也要先等它们结束，不然同一窗口会有两条扫描线程同时扫
+        self._stopping: list[tuple[MonitorWorker, float]] = []
+        # 停止/启动的代数：后台收尾线程据此判断「这期间又启动过」，避免把新的运行状态清掉
+        self._epoch = 0
         # 统计状态独立于线程存放：停止后界面仍能看到本次运行的累计数字
         self._states: dict[str, MonitorState] = {}
         # 可重入：start/update_config 持锁创建 worker 时还会再次进入 get_state
@@ -503,6 +512,8 @@ class Engine:
         with self._lock:
             if self._running.is_set():
                 return True
+            self._epoch += 1          # 作废还在后台收拾的上一轮停止
+            self._reap_stopping()     # 上一轮的线程没退干净就再启动，同一窗口会两条线程
             # 先重置统计再建线程：worker 构造时会认领自己的状态对象
             self._states = {m.name: MonitorState(m.name) for m in enabled}
             self._workers = {m.name: MonitorWorker(self, m) for m in enabled}
@@ -523,16 +534,41 @@ class Engine:
         elif self.ocr.cap_note:
             self.log("warn", self.ocr.cap_note)
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
+        """停止所有监控窗口。
+
+        wait=False 是给界面线程用的：一帧最长 3~5s（OCR 卡在长帧上），在 tkinter
+        主线程里同步 join 会把界面一起卡住，表现就是按下「停止」后窗口「未响应」
+        几秒。这时候只劝停、立刻把运行状态置回停止，让一个后台线程去等线程真的
+        退干净。脚本和测试保持默认的同步行为。真正启动前也会先等这些线程退干净
+        （见 _reap_stopping），不会出现两条线程扫同一个窗口。
+        """
         with self._lock:
             workers = list(self._workers.values())
             self._workers = {}
+            self._stopping.extend((w, time.monotonic() + 5.0) for w in workers)
+            self._epoch += 1
+            epoch = self._epoch
         for worker in workers:
             worker.stop()
+        if not wait:
+            self._running.clear()
+            self._emit_state()
+            threading.Thread(target=self._join_workers, args=(workers, epoch),
+                             name="engine-stop", daemon=True).start()
+            return
+        self._join_workers(workers, epoch)
+
+    def _join_workers(self, workers: list[MonitorWorker], epoch: int) -> None:
+        """等扫描线程真的退干净（异步停止时这段等待在后台线程里做）。"""
         deadline = time.monotonic() + 5.0
         for worker in workers:
             remaining = max(0.0, deadline - time.monotonic())
             worker.join(timeout=remaining)
+        with self._lock:
+            if epoch != self._epoch:
+                return          # 这期间又重新启动过：状态归新周期说话，别把它清掉
+            self._stopping = [item for item in self._stopping if item[0] not in workers]
         stuck = [w.monitor.name for w in workers if w.is_alive()]
         if stuck:
             self.log("warn", f"以下窗口的扫描线程未在 5s 内退出（可能正忙）：{', '.join(stuck)}")
@@ -540,9 +576,19 @@ class Engine:
         self.log("info", "引擎已停止。")
         self._emit_state()
 
-    def toggle(self) -> bool:
+    def _reap_stopping(self) -> None:
+        """启动前等上一轮劝停的线程退干净，否则同一窗口两条扫描线程、一次弹窗点两下。
+        上限是停止那一刻起 5s；线程每轮都查停止旗标，通常远小于 1s。"""
+        with self._lock:
+            pending = list(self._stopping)
+        for worker, deadline in pending:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            self._stopping = [item for item in self._stopping if item[0].is_alive()]
+
+    def toggle(self, wait: bool = True) -> bool:
         if self.running:
-            self.stop()
+            self.stop(wait=wait)
         else:
             self.start()
         return self.running
@@ -732,6 +778,14 @@ class Engine:
                                      f"{gap:.0f}px 外刚刚点过（同一张弹窗），先跳过；"
                                      f"要每见每点就把「点击与启动」里的同弹窗防重复设为 0。")
                 continue
+            if worker.stop_event.is_set():
+                break                   # 正在停止：这一帧扫完就收手，不再点
+            if tracked_hwnd and not window_alive(tracked_hwnd):
+                # 直播窗口在这一帧的检测过程中被关掉了：窗口没了，截图时记下的矩形
+                # 只是屏幕上一段旧坐标，照旧点下去点中的是桌面或别的窗口。安静跳过，
+                # 等窗口重新出现再继续（note_click_lost 保证只提醒一次）。
+                worker.note_click_lost()
+                break
             try:
                 self.clicker.click(click_x, click_y)
             except Exception as exc:

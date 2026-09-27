@@ -39,6 +39,12 @@ def _stub_ocr(hits):
              "recognize": staticmethod(lambda *a, **k: hits)})()
 
 
+# 点击链路测试用的假句柄（7777）在系统里并不存在，`window_alive` 一句 IsWindow 就会
+# 判成「直播窗口刚被关掉」，整轮跳过点击、一个都点不出去。可系统恰好有个真窗口占用
+# 同一个号时它又会变回 True——同一套测试时绿时红，全看句柄表当下长什么样。
+# 这些测试必须显式接管它，只验自己那段逻辑。
+
+
 def test_merged_keyword_box() -> None:
     """识别网络把两个按钮读成一个框时，要按关键词各自收窄。"""
     hits = [OcrHit("签到奖券", 0.77, 72, 146, 200, 50),
@@ -618,7 +624,6 @@ def test_crop_left_removes_session_column() -> None:
     assert sig[-4] == 10 and sig[-3] == 0 and sig[-2] == 800 and sig[-1] is False, sig
 
 
-
 def test_ocr_provider_patch() -> None:
     """GPU 后端要真能塞到 rapidocr 的会话里，塞不进去不能把 OCR 搞坏。
 
@@ -862,11 +867,14 @@ def test_process_frame_clicks_popup_once() -> None:
     """整链路复现真机的「一张弹窗点两次」：第二下要被拦下，且要点数只记一次。"""
     import numpy as np
     import core.capture as cap
+    import core.engine as engine_mod
     from core.ocr import OcrHit
 
     real_at, real_root = cap.window_at, cap.root_hwnd
+    real_alive = engine_mod.window_alive
     cap.window_at = lambda x, y: 7777
     cap.root_hwnd = lambda h: int(h or 0)
+    engine_mod.window_alive = lambda hwnd: True
     try:
         # 一帧里同时读到两个词：弹窗主按钮「立即领券」和它下面的「奖券」
         hits = [OcrHit("立即领券", 0.9, 600, 600, 90, 30),
@@ -902,6 +910,7 @@ def test_process_frame_clicks_popup_once() -> None:
         assert len(clicks) == 2, clicks
         assert worker._guard_skipped == 2, "关掉之后不该再拦"
     finally:
+        engine_mod.window_alive = real_alive
         cap.window_at, cap.root_hwnd = real_at, real_root
 
 
@@ -929,8 +938,23 @@ def test_ocr_idle_downshift() -> None:
     worker._idle_rounds = 9
     worker._ocr_since = 0
     assert worker._ocr_due_this_round(), "点完该补一次完整 OCR"
+    # 刚点完一发：下一轮必须补一次完整 OCR。标记只允许在「真扫上」时清掉
+    # （run() 里那一行），所以这里只看不删——点完那一发若被判成「画面没变」
+    # 整轮跳过，确认用的那次 OCR 不能被提前吃掉。
+    worker._ocr_force = True
+    worker._ocr_since = 0
     worker._round += 1
-    assert not worker._ocr_due_this_round(), "强制那一次用掉就回到降频节奏"
+    assert worker._ocr_due_this_round(), "点完该补一次完整 OCR"
+    assert worker._ocr_force, "标记得留到真的扫上才清，整轮跳过时还要用"
+    worker._ocr_since = 0
+    worker._round += 1
+    assert worker._ocr_due_this_round(), "上一轮没扫上，这轮还得补"
+
+    # 真扫上了（run() 清标记）：之后回到降频节奏，不再每轮都跑
+    worker._ocr_force = False
+    worker._ocr_since = 0
+    worker._round += 1
+    assert not worker._ocr_due_this_round(), "补完就回到降频节奏"
 
     # 关掉降频（idle_every=1）就是老行为：每轮都跑
     engine.settings.ocr_idle_every = 1
@@ -1370,6 +1394,7 @@ def test_click_blocked_when_point_is_covered() -> None:
     """
     import numpy as np
     import core.capture as cap
+    import core.engine as engine_mod
     from core.capture import window_owns_point
     from core.ocr import OcrHit
 
@@ -1383,9 +1408,12 @@ def test_click_blocked_when_point_is_covered() -> None:
     def with_top(top, fn):
         cap.window_at = lambda x, y: top
         cap.root_hwnd = lambda h: int(h or 0)
+        real_alive = engine_mod.window_alive
+        engine_mod.window_alive = lambda hwnd: True
         try:
             return fn()
         finally:
+            engine_mod.window_alive = real_alive
             cap.window_at, cap.root_hwnd = real_at, real_root
 
     assert with_top(0, lambda: window_owns_point(4242, 10, 10)) is True, "问不出就不拦"
@@ -1426,9 +1454,6 @@ def test_click_blocked_when_point_is_covered() -> None:
     assert any("被别的窗口盖着" in m and "签到" in m for m in warnings), warnings
 
 
-
-
-
 def test_blocked_click_raises_window_first() -> None:
     """命中按钮但那个点被别的窗口盖着时，先把直播窗口调到前台再点。
 
@@ -1461,6 +1486,8 @@ def test_blocked_click_raises_window_first() -> None:
     real_bring, real_min = engine_mod.bring_to_front, engine_mod.is_minimized
     real_ident = engine_mod.window_identity_at
     real_drop = engine_mod.drop_topmost
+    real_alive = engine_mod.window_alive
+    engine_mod.window_alive = lambda hwnd: True
     state["dropped"] = []
     engine_mod.drop_topmost = lambda hwnd: state["dropped"].append(int(hwnd))
     # _cover_label 问的是 engine 命名空间里的 window_identity_at，不是 cap.window_at，
@@ -1517,6 +1544,7 @@ def test_blocked_click_raises_window_first() -> None:
         engine_mod.bring_to_front, engine_mod.is_minimized = real_bring, real_min
         engine_mod.window_identity_at = real_ident
         engine_mod.drop_topmost = real_drop
+        engine_mod.window_alive = real_alive
 
 
 def test_offscreen_window_moved_before_click() -> None:
@@ -1553,6 +1581,8 @@ def test_offscreen_window_moved_before_click() -> None:
     real_drop, real_ident = engine_mod.drop_topmost, engine_mod.window_identity_at
     real_onscreen, real_move = engine_mod.point_on_screen, engine_mod.move_window_into_view
     real_restore = engine_mod.restore_window_position
+    real_alive = engine_mod.window_alive
+    engine_mod.window_alive = lambda hwnd: True
     engine_mod.drop_topmost = lambda hwnd: None
     engine_mod.bring_to_front = lambda hwnd: False
     engine_mod.is_minimized = lambda hwnd: False
@@ -1628,6 +1658,7 @@ def test_offscreen_window_moved_before_click() -> None:
         engine_mod.drop_topmost, engine_mod.window_identity_at = real_drop, real_ident
         engine_mod.point_on_screen, engine_mod.move_window_into_view = real_onscreen, real_move
         engine_mod.restore_window_position = real_restore
+        engine_mod.window_alive = real_alive
 
 
 def test_run_logger_flushes_and_survives() -> None:
@@ -1675,6 +1706,99 @@ def test_run_logger_flushes_and_survives() -> None:
     assert not os.path.exists(os.path.join(os.getcwd(), "logs")) or True
 
 
+def test_stop_is_non_blocking_and_does_not_duplicate_workers() -> None:
+    """界面线程按下「停止」不能被扫描线程拖住。
+
+    join 最长 5s（单帧 OCR 卡在长帧上），同步停在 tkinter 主线程里就表现为界面「未响应」
+    几秒。异步停止必须做到三件事：立刻回到停止态、后台最终真的收尾、再启动前先把上一轮
+    的线程等干净（否则同一窗口两条扫描线程，弹窗会被点两下）。
+    """
+    import time
+    import core.engine as engine_mod
+    import threading
+
+    eng = Engine(Settings(scan_interval_sec=30.0, jitter_sec=0.0),
+                 [Monitor("窗口A", [0, 0, 600, 260])],
+                 [Target("签到", ocr_keywords=["签到"])])
+    assert eng.start()
+    worker = next(iter(eng._workers.values()))
+    held = threading.Event()
+
+    def fake_join(*a, **k):
+        held.set()          # 「线程还没退」这把钥匙由测试握着，见下面的 finally
+        time.sleep(0.2)
+
+    worker.join = fake_join
+    try:
+        eng.stop(wait=False)
+        assert not eng.running, "异步停止必须立刻回到停止态"
+        assert held.is_set() and worker.is_alive(), "这一版 stop 不该同步 join 扫描线程"
+        assert eng._stopping and eng._stopping[0][0] is worker
+        for _ in range(200):
+            if not eng._stopping:
+                break
+            time.sleep(0.02)
+        assert eng._stopping == [], "后台线程必须把已收尾的 worker 从待收尾列表里摘掉"
+
+        # 线程还没退干净时再启动：必须先把上一轮的等掉，不能出现两条扫描线程
+        worker.is_alive = lambda: False      # 假装这一轮已经退干净
+        eng.start()
+        names = [t.name for t in threading.enumerate() if t.name.startswith("scan-")]
+        assert names.count("scan-窗口A") == 1, names
+        eng.stop()
+    finally:
+        worker.stop()
+        if worker.is_alive():
+            worker.join(timeout=2.0)
+
+
+def test_click_skipped_when_window_closed_during_scan() -> None:
+    """从截图到点击隔着几次 OCR（一两秒），这期间用户可能把直播间关了。
+
+    窗口一没，截图时记下的矩形只是屏幕上一段旧坐标，照旧点下去点中的就是桌面
+    或者正好飘到那儿的别的窗口。这一发必须跳过，且只提醒一次。
+    """
+    import numpy as np
+    import core.capture as cap
+    import core.engine as engine_mod
+    from core.ocr import OcrHit
+
+    real_at, real_root = cap.window_at, cap.root_hwnd
+    real_alive = engine_mod.window_alive
+    cap.window_at = lambda x, y: 7777
+    cap.root_hwnd = lambda h: int(h or 0)
+    engine_mod.window_alive = lambda hwnd: False      # 直播窗口刚被关掉
+    try:
+        eng = Engine(Settings(scan_interval_sec=1.5, jitter_sec=0.0, ocr_min_score=0.5),
+                     [Monitor("直播间", [0, 0, 400, 600])],
+                     [Target("兑换券", ocr_keywords=["立即领券"])])
+        worker = MonitorWorker(eng, eng.monitors[0])
+        worker.region = (0, 0, 400, 600)
+        worker.ocr_due = True
+        worker._locator._current_hwnd = 7777
+        worker.detector.ocr = _stub_ocr([OcrHit("立即领券", 0.9, 600, 600, 90, 30)])
+        clicks: list[tuple[int, int]] = []
+        eng.clicker = type("Rec", (), {
+                         "click": staticmethod(lambda x, y: clicks.append((x, y)))})()
+        frame = np.zeros((600, 400, 3), np.uint8)
+        for _ in range(3):
+            eng.process_frame(worker, frame)
+        assert clicks == [], f"窗口都没了还点：{clicks}"
+        assert worker.state.clicks == 0
+        assert worker.state.hits == 3, "命中照常计数，只是这一发点不出去"
+        warns = [e.payload["message"] for e in _drain(eng.events)
+                if e.payload.get("level") == "warn"]
+        lost = [m for m in warns if "点击前发现直播窗口已消失" in m]
+        assert len(lost) == 1, f"这条提醒只该出现一次：{warns}"
+
+        # 窗口回来之后又能点：只是等它回来，不是把扫描停掉
+        engine_mod.window_alive = lambda hwnd: True
+        eng.cooldowns.reset()
+        eng.process_frame(worker, frame)
+        assert clicks == [(645, 615)], clicks
+    finally:
+        cap.window_at, cap.root_hwnd = real_at, real_root
+        engine_mod.window_alive = real_alive
 
 def test_build_script_is_ascii_and_strips_bad_crt() -> None:
     """build.bat 是「打包静默失败」的历史重灾区，两条都得守住。
@@ -1726,6 +1850,8 @@ def main() -> int:
              test_popup_window_counts_as_reachable,
              test_click_prefers_full_button_text_over_danmaku,
              test_run_logger_flushes_and_survives,
+             test_stop_is_non_blocking_and_does_not_duplicate_workers,
+             test_click_skipped_when_window_closed_during_scan,
              test_build_script_is_ascii_and_strips_bad_crt]
     for test in tests:
         test()
