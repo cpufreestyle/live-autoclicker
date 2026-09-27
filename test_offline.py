@@ -410,6 +410,22 @@ def test_config_watch_applies_changes() -> None:
         mp = os.path.join(d, "monitors.yaml")
         with open(mp, "w", encoding="utf-8") as fh:
             fh.write("monitors: []" + chr(10))
+
+        writes = {"n": 0}
+
+        def _write(text: str) -> None:
+            """改配置并保证 mtime 一定变。
+
+            Windows 上同一文件快速重写两次，st_mtime 可以完全相同（实测 200 里约 4 次），
+            而热更新正是拿 mtime 比对，于是这个测试会偶发「一次都没重载」。
+            每次往后推 1ms（远大于 float 存秒级时间戳的精度），不靠 sleep 碰运气。
+            """
+            with open(mp, "w", encoding="utf-8") as fh:
+                fh.write(text + chr(10))
+            writes["n"] += 1
+            stamp = int(os.path.getmtime(mp) * 1e9) + writes["n"] * 1_000_000
+            os.utime(mp, ns=(stamp, stamp))
+
         obj = types.SimpleNamespace(
             _config_files={"monitors": mp},
             _config_mtimes={},
@@ -427,8 +443,7 @@ def test_config_watch_applies_changes() -> None:
             assert calls["update"] is None and calls["refreshed"] == 0
 
             calls.update(settings=0, monitors=0, targets=0)
-            with open(mp, "w", encoding="utf-8") as fh:
-             fh.write("monitors: [] changed" + chr(10))
+            _write("monitors: [] changed")
             mw.MainWindow._watch_config_files(obj)          # change -> reload + apply
             assert calls["settings"] == 1 and calls["monitors"] == 1 and calls["targets"] == 1
             assert calls["update"] == ("SET", ["MON"], ["TGT"]), calls["update"]
@@ -442,8 +457,7 @@ def test_config_watch_applies_changes() -> None:
              raise ConfigError("broken")
             mw.load_monitors = boom
             calls["update"] = None
-            with open(mp, "w", encoding="utf-8") as fh:
-             fh.write("monitors: [] again" + chr(10))
+            _write("monitors: [] again")
             mw.MainWindow._watch_config_files(obj)          # parse error -> keep, no apply
             assert calls["update"] is None
         finally:
@@ -1233,6 +1247,17 @@ def test_ocr_bench_picks_fastest_full_recall() -> None:
     settings = Settings(ocr_max_side=1280, ocr_min_side=0, ocr_threads=1)
     monitor = Monitor("W", [0, 0, 400, 300])
 
+    def _wait(seconds: float) -> None:
+        """自旋等固定时长，别用 time.sleep。
+
+        桩子里每档只睡 6~20ms，而 Windows 的时钟 tick 约 15.6ms：一次抖动就能让
+        某一档凭空多 16ms，把「和最快相差不到 10%」那条判据打翻，于是
+        「等成本时推荐最小档」这句断言 15 次里挂 2 次（实测）。自旋没有量化误差。
+        """
+        deadline = time.perf_counter() + seconds
+        while time.perf_counter() < deadline:
+            pass
+
     # 640 只读到一段 -> 召回差一截，不能推荐；960 及以上都读全，应取最小的 960
     def hits_for(side):
         texts = ["签到", "立即领取"] if side >= 960 else ["签到"]
@@ -1243,7 +1268,7 @@ def test_ocr_bench_picks_fastest_full_recall() -> None:
         available = True
 
         def recognize(self, frame, max_side, min_side):
-            time.sleep(max_side / 100000.0)
+            _wait(max_side / 100000.0)
             return hits_for(max_side)
 
     def run(engine):
@@ -1265,17 +1290,18 @@ def test_ocr_bench_picks_fastest_full_recall() -> None:
     # 每档耗时一样时只能推荐最小的那档，不能推出个最大的来
     class Same(Stub):
         def recognize(self, frame, max_side, min_side):
-            time.sleep(0.02)
+            _wait(0.02)
             return [OcrHit("签到", 0.9, 0, 0, 30, 20)]
-    assert "建议：ocr_max_side=640" in run(Same()), run(Same())
+    tied = run(Same())
+    assert "建议：ocr_max_side=640" in tied, tied
 
     # 召回差一截的档绝不能被推荐：这里 960 只读到「奖券」，而基准（最大档）是「兑换券」
     class Partial(Stub):
-        # 耗时仍然随档位增长（不能省掉）：不睡的话每档都是几微秒的计时噪声，
+        # 耗时仍然随档位增长（不能省掉）：不去等的话每档都是几微秒的计时噪声，
         # 「挑小的」这个断言就变成掷硬币。
         def recognize(self, frame, max_side, min_side):
             table = {640: "签到", 960: "奖券"}
-            time.sleep(max_side / 100000.0)
+            _wait(max_side / 100000.0)
             return [OcrHit(table.get(max_side, "兑换券"), 0.9, 0, 0, 30, 20)]
     text = run(Partial())
     assert "建议：ocr_max_side=1280" in text, text
