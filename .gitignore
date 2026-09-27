@@ -18,3 +18,5 @@ logs/
 templates/probe.txt
 templates/subprobe/
 templates/tmp*/
+# 发布用的 zip 有 80+MB，不入仓库；发布说明和发布脚本（release/ 下）照常入库
+release/*.zip
