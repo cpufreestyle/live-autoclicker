@@ -1,0 +1,13 @@
+monitors:
+- name: 直播A
+  region: null
+  enabled: true
+  scan_interval_sec: null
+  ocr_max_side: null
+  window_title: ''
+  window_class: Chrome_WidgetWin_0
+  window_process: WeChatAppEx.exe
+  crop_bottom: 0
+  crop_right: 0
+  crop_left: 0
+  background_capture: true

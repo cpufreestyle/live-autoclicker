@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 打包中间产物与 exe 输出（build.bat / PyInstaller 会重建）
+build/
+dist/
+
+# 运行期日志
+logs/
+*.log
+
+# 排查过程中随手写的脚本与抓屏，含桌面截图 —— 不入库
+.tmp_*
+*.tmp
+
+# 探针/模板调试期的临时输出
+templates/probe.txt
+templates/subprobe/
+templates/tmp*/

@@ -1,0 +1,39 @@
+targets:
+- name: 签到
+  template: ''
+  ocr_keywords:
+  - 签到
+  - 立即签到
+  click_offset:
+  - 0
+  - 0
+  cooldown_sec: 30.0
+  enabled: true
+  match_threshold: null
+  monitors: []
+- name: 奖券
+  template: ''
+  ocr_keywords:
+  - 奖券
+  - 领取
+  click_offset:
+  - 0
+  - 0
+  cooldown_sec: 20.0
+  enabled: true
+  match_threshold: null
+  monitors: []
+- name: 兑换券
+  template: templates/ljsq_button.png
+  ocr_keywords:
+  - 立即领券
+  - 立即领取
+  - 领券
+  - 立即领
+  click_offset:
+  - 0
+  - 0
+  cooldown_sec: 30.0
+  enabled: true
+  match_threshold: null
+  monitors: []
