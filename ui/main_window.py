@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import queue
+import re
 import subprocess
 import time
 import tkinter as tk
@@ -12,8 +13,8 @@ from typing import Callable
 
 from core.capture import ScreenCapture, root_hwnd, set_process_dpi_awareness
 from core.config import (BASE_DIR, OCR_PROVIDER_CHOICES, ConfigError, Monitor, Settings, Target, abs_path, changed_config_files, config_files,
-                         load_monitors, load_settings, load_targets, save_monitors,
-                         save_settings, save_targets, unique_name)
+                         load_monitors, load_settings, load_targets, load_ui_state, save_monitors,
+                         save_settings, save_targets, save_ui_state, unique_name)
 from core.detector import CooldownTracker, Detector, resolve_region
 from core.engine import Engine, Event
 from core.hotkey import HotkeyManager
@@ -26,10 +27,43 @@ from ui.theme import apply_theme
 
 # 自动启动前的缓冲：让界面先画完，也留出关窗反悔的时间
 AUTO_START_DELAY = 3.0
-# 品牌区图标的目标边长（按 96 DPI 设计，实际用 _px 放大）
-BRAND_ICON_PX = 30
 # 列表为空时的占位提示行前缀：选中占位行按「空列表」处理，不能当成真实行的下标用
 EMPTY_HINT = "（空）"
+# 主窗口默认尺寸（按 96 DPI 设计的像素）。用户拖动改过大小就记进 config/ui.yaml，
+# 下次启动按他的来；这里只是第一次打开时的样子——直播间要盯，界面不该抢屏幕。
+DEFAULT_WINDOW_SIZE = (880, 640)
+# 下限由实测决定，别随手改小：
+#  · 宽 870 —— 按钮平铺一行需 405/411px，「按钮目标」那张表共 462px 宽。
+#    比这再窄，要么最后一个按钮被 ttk 压成 1px「隐形」，要么表的最右一列被裁掉；
+#  · 高 600 —— 让运行日志保底还有三行半，再矮它就被压成一条缝。
+MIN_WINDOW_SIZE = (870, 600)
+# 品牌区图标的目标边长（按 96 DPI 设计，实际用 _px 放大）
+BRAND_ICON_PX = 24
+# Tk 的 winfo_geometry() 形如 "860x520+120+80"；负坐标写作 "+-100+-50"，
+# 而手改 ui.yaml 的人多半直接写 "-100-50"。两种都收，别让手改把启动卡住。
+_GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:\+?([+-]?\d+))?(?:\+?([+-]?\d+))?$")
+
+
+def sane_geometry(raw, screen_w: int, screen_h: int, min_w: int, min_h: int) -> str | None:
+    """把「上次的 geometry」夹回当前屏幕内；不可用就返回 None，让调用方用默认值。
+
+    屏幕尺寸会变（显示器拔了、远程桌面、DPI 改过），上次的 1720x1040 到了小屏上等于
+    整个窗口跑到看不见的地方。存的是 Tk 报的实际像素，所以这里不再做 DPI 缩放。
+    """
+    m = _GEOMETRY_RE.match(str(raw or "").strip())
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        return None
+    w = max(min_w, min(w, screen_w))
+    h = max(min_h, min(h, screen_h))
+    # 位置至少要保证窗口左上角在屏幕内，否则标题栏看不见就没法挪回来了
+    x = int(m.group(3) or 0)
+    y = int(m.group(4) or 0)
+    x = max(0, min(x, max(0, screen_w - min_w)))
+    y = max(0, min(y, max(0, screen_h - min_h)))
+    return f"{w}x{h}+{x}+{y}"
 
 
 def _ui_scale(root: tk.Tk) -> float:
@@ -46,6 +80,7 @@ class MainWindow:
         # 手改 yaml 改坏是常事：先收着校正说明，等日志框建好再回放，别抛 traceback
         self._config_warnings: list[str] = []
         report = self._config_warnings.append
+        self.ui_state: dict = load_ui_state()
         self.settings: Settings = load_settings(report)
         self.monitors: list[Monitor] = load_monitors(report)
         self.targets: list[Target] = load_targets(report)
@@ -69,13 +104,13 @@ class MainWindow:
         self.scale = _ui_scale(root)
         self.theme = apply_theme(root, self._px)
         self._brand_icon = self._load_icons()
-        # 缩放后可能超出屏幕（4K 200% 时 1180x760 会变成 2360x1520），所以要夹到屏幕内
-        width = min(self._px(1180), root.winfo_screenwidth() - 40)
-        height = min(self._px(820), root.winfo_screenheight() - 60)
-        root.geometry(f"{width}x{height}")
-        root.minsize(min(self._px(980), width), min(self._px(620), height))
+        self._apply_window_geometry()
         self._apply_job: str | None = None
         self._build_widgets()
+        # 量一次真实尺寸再往下走：窗口太窄时 ttk 会把按钮压成一条缝，下面自检要说话
+        # 就得先有一份真实布局，否则量出来的都是 0
+        root.update()
+        self._check_layout_budget()
         self._load_settings_to_vars()
         self._refresh_monitors()
         self._refresh_targets()
@@ -90,6 +125,41 @@ class MainWindow:
         root.after(150, self._pump_events)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._schedule_auto_start()
+
+    def _apply_window_geometry(self) -> None:
+        """窗口大小：优先按上次存下来的，否则用紧凑默认值；两种来源都夹到当前屏幕内。"""
+        root = self.root
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        min_w, min_h = self._px(MIN_WINDOW_SIZE[0]), self._px(MIN_WINDOW_SIZE[1])
+        geometry = sane_geometry(self.ui_state.get("geometry"), screen_w, screen_h,
+                                 min_w, min_h)
+        if geometry is None:
+            width = min(self._px(DEFAULT_WINDOW_SIZE[0]), screen_w - 40)
+            height = min(self._px(DEFAULT_WINDOW_SIZE[1]), screen_h - 60)
+            geometry = f"{max(min_w, width)}x{max(min_h, height)}"
+        root.geometry(geometry)
+        root.minsize(min_w, min_h)
+
+    def _check_layout_budget(self) -> None:
+        """启动时量一次：窄窗口会不会把按钮或表格挤坏。
+
+        卡的宽度一半来自列宽、一半来自按钮文字，改任何一边都可能让某个按钮被
+        ttk 压成 1px「隐形」（老版本为此把按钮拆成两行，现在是按 462px 的
+        左栏预算平铺一行）。这里只报一次，不阻断启动——把窗口拉宽就好。
+        """
+        squeezed: list[str] = []
+        for name, card in (("监控窗口", self.mon_tree.master),
+                           ("按钮目标", self.tree.master)):
+            for button in card.winfo_children()[-1].winfo_children():
+                if button.winfo_width() + 1 < button.winfo_reqwidth():
+                    squeezed.append(f"{name}的「{button.cget('text')}」")
+        table_w = sum(int(self.tree.column(c, "width"))
+                      for c in tuple(self.tree.cget("columns")) + ("#0",))
+        if table_w > self.mon_tree.master.winfo_width():
+            squeezed.append("「按钮目标」最右一列")
+        if squeezed:
+            self._log("warn", "窗口偏窄，" + "、".join(squeezed)
+                           + " 显示不全；把窗口拉宽一点即可（本身功能不受影响）。")
 
     # ---------- UI 构建 ----------
     def _px(self, value: int) -> int:
@@ -122,7 +192,7 @@ class MainWindow:
         self._build_header()
 
         body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=self._px(12), pady=self._px(12))
+        body.pack(fill="both", expand=True, padx=self._px(8), pady=self._px(8))
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
         body.rowconfigure(0, weight=3)
@@ -135,49 +205,42 @@ class MainWindow:
         mon_frame.grid(row=0, column=0, sticky="nsew")
         mcols = ("enabled", "region", "interval", "scans", "clicks", "note")
         self.mon_tree = self._make_tree(mon_frame, mcols, {
-            "#0": ("窗口", 110), "enabled": ("启用", 44), "region": ("区域", 178),
-            "interval": ("间隔s", 58), "scans": ("扫描", 56), "clicks": ("点击", 56),
-            "note": ("状态", 170),
-        }, height=4)
+            "#0": ("窗口", 70), "enabled": ("启用", 34), "region": ("区域", 86),
+            "interval": ("间隔s", 44), "scans": ("扫描", 40), "clicks": ("点击", 40),
+            "note": ("状态", 120),
+        }, height=3)
         self.mon_tree.bind("<Double-1>", lambda e: self._edit_monitor())
 
-        # 五个按钮一排比左栏还宽，挤不下时 ttk 会把多余的按钮压成 1px「隐形」，所以分两行
+        # 五个按钮平铺一行实测 427px，比左卡（472px）窄，所以放回一行：
+        # 挤不下的话 ttk 会把按钮压成 1px「隐形」，启动时要 assert 一下有没有被压扁。
         mbtns = ttk.Frame(mon_frame)
-        mbtns.pack(fill="x", pady=(self._px(8), 0))
-        row1 = ttk.Frame(mbtns)
-        row1.pack(side="top", fill="x")
-        row2 = ttk.Frame(mbtns)
-        row2.pack(side="top", fill="x", pady=(self._px(4), 0))
-        ttk.Button(row1, text="新增窗口", command=self._add_monitor).pack(side="left")
-        ttk.Button(row1, text="编辑", command=self._edit_monitor).pack(side="left", padx=self._px(5))
-        ttk.Button(row1, text="重新框选", command=self._repick_monitor).pack(side="left")
-        ttk.Button(row2, text="启用/停用", command=self._toggle_monitor).pack(side="left")
-        ttk.Button(row2, text="删除", command=self._delete_monitor).pack(side="left", padx=self._px(5))
+        mbtns.pack(fill="x", pady=(self._px(6), 0))
+        ttk.Button(mbtns, text="新增窗口", command=self._add_monitor).pack(side="left")
+        ttk.Button(mbtns, text="编辑", command=self._edit_monitor).pack(side="left", padx=self._px(2))
+        ttk.Button(mbtns, text="重新框选", command=self._repick_monitor).pack(side="left")
+        ttk.Button(mbtns, text="启用/停用", command=self._toggle_monitor).pack(side="left", padx=self._px(2))
+        ttk.Button(mbtns, text="删除", command=self._delete_monitor).pack(side="left")
 
         # 左下：按钮目标
         tgt_frame = ttk.LabelFrame(body, text="按钮目标", style="Card.TLabelframe")
-        tgt_frame.grid(row=1, column=0, sticky="nsew", pady=self._px(12))
+        tgt_frame.grid(row=1, column=0, sticky="nsew", pady=self._px(8))
         self.tree = self._make_tree(tgt_frame, ("enabled", "scope", "template", "keywords",
                                                "offset", "cooldown"), {
-            "#0": ("名称", 110), "enabled": ("启用", 44), "scope": ("生效窗口", 120),
-            "template": ("模板", 140), "keywords": ("OCR关键词", 140),
-            "offset": ("偏移", 66), "cooldown": ("冷却s", 54),
-        }, height=4)
+            "#0": ("名称", 70), "enabled": ("启用", 34), "scope": ("生效窗口", 86),
+            "template": ("模板", 92), "keywords": ("OCR关键词", 92),
+            "offset": ("偏移", 44), "cooldown": ("冷却s", 44),
+        }, height=3)
         self.tree.bind("<Double-1>", lambda e: self._edit_target())
 
         tbtns = ttk.Frame(tgt_frame)
-        tbtns.pack(fill="x", pady=(self._px(8), 0))
-        trow1 = ttk.Frame(tbtns)
-        trow1.pack(side="top", fill="x")
-        trow2 = ttk.Frame(tbtns)
-        trow2.pack(side="top", fill="x", pady=(self._px(4), 0))
-        ttk.Button(trow1, text="新增", command=self._add_target).pack(side="left")
-        ttk.Button(trow1, text="编辑", command=self._edit_target).pack(side="left", padx=self._px(5))
-        ttk.Button(trow1, text="复制到所有窗口",
+        tbtns.pack(fill="x", pady=(self._px(6), 0))
+        ttk.Button(tbtns, text="新增", command=self._add_target).pack(side="left")
+        ttk.Button(tbtns, text="编辑", command=self._edit_target).pack(side="left", padx=self._px(2))
+        ttk.Button(tbtns, text="复制到所有窗口",
                    command=self._copy_target_to_monitors).pack(side="left")
-        ttk.Button(trow2, text="删除", command=self._delete_target).pack(side="left")
-        ttk.Button(trow2, text="启用/停用",
-                   command=self._toggle_enabled).pack(side="left", padx=self._px(5))
+        ttk.Button(tbtns, text="删除", command=self._delete_target).pack(side="left", padx=self._px(2))
+        ttk.Button(tbtns, text="启用/停用",
+                   command=self._toggle_enabled).pack(side="left")
 
         # 右：参数（吃掉整个右列高度，日志才有地方横铺）
         self._build_params(body).grid(row=0, column=1, rowspan=2, sticky="nsew",
@@ -185,14 +248,14 @@ class MainWindow:
 
         # 底：日志
         logbox = ttk.LabelFrame(body, text="运行日志", style="Card.TLabelframe")
-        logbox.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(self._px(12), 0))
+        logbox.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(self._px(8), 0))
         pal = self.theme.palette
         # width 按字符算，默认 80 字符会把整行撑出屏幕
-        self.log_text = tk.Text(logbox, width=40, height=6, wrap="word", relief="flat",
+        self.log_text = tk.Text(logbox, width=40, height=4, wrap="word", relief="flat",
                                 background=pal.surface, foreground=pal.text,
                                 insertbackground=pal.text, highlightthickness=1,
                                 highlightbackground=pal.border_strong, highlightcolor=pal.accent,
-                                padx=self._px(8), pady=self._px(6),
+                                padx=self._px(6), pady=self._px(4),
                                 font=self.theme.fonts["mono"])
         for tag, color in (("info", pal.text), ("warn", pal.warn), ("error", pal.danger)):
             self.log_text.tag_configure(tag, foreground=color)
@@ -209,7 +272,7 @@ class MainWindow:
                       style="Header.TSeparator").pack(side="bottom", fill="x")
 
         brand = ttk.Frame(head, style="Header.TFrame")
-        brand.pack(fill="x", padx=self._px(16), pady=(self._px(12), self._px(4)))
+        brand.pack(fill="x", padx=self._px(12), pady=(self._px(6), self._px(1)))
         icon = self._brand_icon
         if icon is not None:
             ttk.Label(brand, image=icon, style="Header.TLabel").pack(side="left",
@@ -231,7 +294,7 @@ class MainWindow:
                   style="Header.Subtitle.TLabel").pack(side="right", padx=(0, self._px(12)))
 
         tools = ttk.Frame(head, style="Header.TFrame")
-        tools.pack(fill="x", padx=self._px(16), pady=(self._px(4), self._px(12)))
+        tools.pack(fill="x", padx=self._px(12), pady=(0, self._px(6)))
         self.run_btn = ttk.Button(tools, text="▶ 启动", style="Primary.TButton",
                                   command=self.toggle_run)
         self.run_btn.pack(side="left")
@@ -1030,6 +1093,10 @@ class MainWindow:
                 fn(payload)
             except ConfigError as exc:
                 failed.append(f"{label}：{exc}")
+        try:
+            save_ui_state({"geometry": self.root.winfo_geometry()})
+        except ConfigError:
+            pass        # 记不下窗口大小不该拦住退出
         if failed:
             # 界面马上要拆，日志框里写了也看不见；退出前弹窗说明哪些改动没落盘
             messagebox.showwarning("部分配置未保存", "\n".join(failed))

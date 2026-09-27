@@ -16,6 +16,9 @@ CONFIG_DIR = "config"
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.yaml")
 MONITORS_FILE = os.path.join(CONFIG_DIR, "monitors.yaml")
 TARGETS_FILE = os.path.join(CONFIG_DIR, "targets.yaml")
+# 界面自己的状态（窗口大小/位置）。单独一个文件：settings.yaml 是用户手调的运行参数，
+# 而窗口大小是程序写的，混在一起会在界面的参数区里凭空多出一堆看不懂的键。
+UI_STATE_FILE = os.path.join(CONFIG_DIR, "ui.yaml")
 
 Reporter = Callable[[str], None]
 # OCR 后端白名单，与 core/ocr.py 的 PROVIDER_CHOICES 保持一致
@@ -521,3 +524,16 @@ def _write_yaml(path: str, payload: Any, report: Reporter | None = None) -> None
         message = f"无法保存 {basename}：{exc}"
         _warn(report, message)
         raise ConfigError(message) from exc
+
+# ---------- 界面状态（窗口大小/位置） ----------
+def load_ui_state(report: Reporter | None = None) -> dict:
+    """读界面状态。文件不存在或内容坏了都退回空 dict：窗口大小记不住不该拦住启动。"""
+    try:
+        data = _read_yaml(_path(UI_STATE_FILE))
+    except ConfigError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_ui_state(state: dict, report: Reporter | None = None) -> None:
+    _write_yaml(_path(UI_STATE_FILE), state, report)

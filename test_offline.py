@@ -1825,6 +1825,35 @@ def test_build_script_is_ascii_and_strips_bad_crt() -> None:
     assert "opencv_videoio_ffmpeg" in text, "build.bat 仍应删除 ffmpeg dll"
 
 
+def test_ui_state_round_trip() -> None:
+    """窗口大小要记住，「界面尽量小」才在下次打开时仍然成立；没有文件也不能抛错。"""
+    import core.config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original = config_mod._path
+        config_mod._path = lambda name: os.path.join(tmp, name)
+        try:
+            assert config_mod.load_ui_state() == {}
+            config_mod.save_ui_state({"geometry": "860x520+120+80"})
+            assert config_mod.load_ui_state() == {"geometry": "860x520+120+80"}
+        finally:
+            config_mod._path = original
+
+
+def test_sane_geometry_clamps_and_rejects() -> None:
+    """存下来的几何必须夹回当前屏幕，否则换个显示器/改过 DPI 就找不着窗口。"""
+    from ui.main_window import sane_geometry
+
+    assert sane_geometry("860x520+120+80", 1920, 1080, 700, 420) == "860x520+120+80"
+    # 尺寸大过当前屏要夹回来，位置跟着归零（左上角必须可见，否则标题栏都拖不到）
+    assert sane_geometry("4000x3000", 1920, 1080, 700, 420) == "1920x1080+0+0"
+    assert sane_geometry("860x520+5000+5000", 1920, 1080, 700, 420) == "860x520+1220+660"
+    assert sane_geometry("860x520-100-50", 1920, 1080, 700, 420) == "860x520+0+0"
+    # 坏值一律退回 None，让调用方用默认尺寸，而不是把 Tk 炸了
+    for bad in (None, "", "garbage", "0x0", "x520", "-860x-520"):
+        assert sane_geometry(bad, 1920, 1080, 700, 420) is None, bad
+
+
 def main() -> int:
     tests = [test_merged_keyword_box, test_keyword_box_boundaries, test_config_coercion,
              test_template_errors_reported_once, test_abs_path_resolution,
@@ -1852,7 +1881,8 @@ def main() -> int:
              test_run_logger_flushes_and_survives,
              test_stop_is_non_blocking_and_does_not_duplicate_workers,
              test_click_skipped_when_window_closed_during_scan,
-             test_build_script_is_ascii_and_strips_bad_crt]
+             test_build_script_is_ascii_and_strips_bad_crt,
+             test_ui_state_round_trip, test_sane_geometry_clamps_and_rejects]
     for test in tests:
         test()
         print(f"OK  {test.__name__}")
