@@ -1911,6 +1911,59 @@ def test_fast_interval_disabled_when_not_faster_than_slow() -> None:
     assert worker._resolve_fast_interval() == 0.1
 
 
+def test_gpu_health_check_falls_back_to_cpu() -> None:
+    # When a GPU session is built but cannot actually infer, the engine must fall
+    # back to CPU instead of crashing the process on every later frame.
+    from core import ocr as ocr_mod
+
+    class _BrokenEngine:
+        def __call__(self, *a, **k):
+            raise RuntimeError("gpu on fire")
+
+    engine = ocr_mod.OcrEngine(threads=2, provider="directml")
+    engine._engine = _BrokenEngine()
+    assert engine._gpu_healthy() is False
+
+    engine._fallback_to_cpu("GPU 首次推理失败")
+    assert engine.provider == "cpu"
+    assert engine._engine is None
+    assert "已自动退回 CPU" in engine.cap_note
+
+    # A healthy engine must be reported healthy and left alone.
+    class _OkEngine:
+        def __call__(self, *a, **k):
+            return [], []
+
+    ok = ocr_mod.OcrEngine(threads=2, provider="directml")
+    ok._engine = _OkEngine()
+    assert ok._gpu_healthy() is True
+    assert ok.provider == "directml"
+
+
+def test_gpu_health_check_skipped_without_gpu_session() -> None:
+    # No GPU package installed -> apply_provider returns "cpu" -> the check must
+    # never run (there is nothing to check) and the note must stay empty.
+    from core import ocr as ocr_mod
+
+    seen = {"checked": False}
+
+    class _Engine(ocr_mod.OcrEngine):
+        def _gpu_healthy(self):
+            seen["checked"] = True
+            return True
+
+    engine = _Engine(threads=2, provider="auto")
+    # Simulate "no GPU backend available": apply_provider reports cpu.
+    original = ocr_mod.apply_provider
+    ocr_mod.apply_provider = lambda value: "cpu"
+    try:
+        engine._ensure_engine()
+    finally:
+        ocr_mod.apply_provider = original
+    assert seen["checked"] is False, "must not health-check a CPU session"
+    assert engine.gpu_note == ""
+
+
 def main() -> int:
     tests = [test_merged_keyword_box, test_keyword_box_boundaries, test_config_coercion,
              test_template_errors_reported_once, test_abs_path_resolution,
@@ -1941,7 +1994,9 @@ def main() -> int:
              test_build_script_is_ascii_and_strips_bad_crt,
              test_ui_state_round_trip, test_sane_geometry_clamps_and_rejects,
              test_template_fast_tick_skips_ocr_only_targets,
-             test_fast_interval_disabled_when_not_faster_than_slow]
+             test_fast_interval_disabled_when_not_faster_than_slow,
+             test_gpu_health_check_falls_back_to_cpu,
+             test_gpu_health_check_skipped_without_gpu_session]
     for test in tests:
         test()
         print(f"OK  {test.__name__}")

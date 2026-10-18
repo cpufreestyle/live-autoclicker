@@ -1,8 +1,5 @@
 scan_interval_sec: 1.5
 jitter_sec: 0.6
-# 模板通道的轮询间隔。模板匹配实测 15ms/帧，OCR 要 1s/帧；原来两条通道绑在同一个
-# 间隔上，配了模板的目标也只能等 OCR 那 1 秒。现在模板每 fast_interval_sec 扫一次，
-# OCR 仍按上面的 ocr_scan_every / ocr_idle_every 降频。填 0 就是关掉快档。
 fast_interval_sec: 0.1
 match_threshold: 0.85
 ocr_min_score: 0.5
@@ -11,11 +8,7 @@ ocr_min_side: 960
 ocr_concurrency: 1
 ocr_threads: 4
 ocr_scan_every: 1
-# 连续这么多轮什么都没扫到时，OCR 自动改成每这么多轮才跑一次（一有命中立刻恢复）。
-# 直播绝大多数时间没有弹窗，这段 OCR 是白烧 CPU；最坏只让弹窗晚一个间隔被点到。
 ocr_idle_every: 2
-# 点过一发后，附近多少秒内不再点第二下：一张弹窗里常同时写着「立即领券」和「奖券」，
-# 会被连着点两下。填 0 就是每见每点。
 click_guard_sec: 2.0
 ocr_provider: auto
 use_pydirectinput: false
@@ -23,7 +16,7 @@ raise_before_click: true
 bring_window_on_screen: true
 humanize_click: true
 hotkey_toggle: f1
-auto_start: true
+auto_start: false
 highlight_sec: 0.6
 scales:
 - 1.0

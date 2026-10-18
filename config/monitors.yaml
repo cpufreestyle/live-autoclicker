@@ -1,7 +1,7 @@
 monitors:
 - name: 直播A
   region: null
-  enabled: true
+  enabled: false
   scan_interval_sec: null
   ocr_max_side: null
   window_title: ''
@@ -11,3 +11,19 @@ monitors:
   crop_right: 0
   crop_left: 0
   background_capture: true
+- name: 测试窗口
+  region:
+  - 200
+  - 440
+  - 600
+  - 260
+  enabled: true
+  scan_interval_sec: 1.0
+  ocr_max_side: null
+  window_title: ''
+  window_class: ''
+  window_process: ''
+  crop_bottom: 0
+  crop_right: 0
+  crop_left: 0
+  background_capture: false

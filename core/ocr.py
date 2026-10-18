@@ -193,6 +193,7 @@ class OcrEngine:
         self.provider = normalize_provider(provider)
         self.cap_note = ""
         self.gpu_note = ""            # 实际跑在哪个后端，建好会话后回填
+        self._gpu_checked = False    # GPU 健康检查是否已做过（只做一次）
         self._available = RapidOCR is not None
 
     @property
@@ -225,11 +226,42 @@ class OcrEngine:
                     # 而分类器是每检出一个文字框就跑一次——弹幕带上几十个框纯浪费。
                     self._engine = RapidOCR(use_angle_cls=False)
                     self.gpu_note = (self.gpu_note or "").strip()
-                    providers = session_providers(self._engine)
-                    if providers and providers[0] != "CPUExecutionProvider":
-                        self.gpu_note = ("OCR 使用 "
-                                         f"{_GPU_NAMES.get(providers[0], providers[0])} 后端")
+                    # apply_provider 返回的就是本次会话真正用的后端：没装 GPU 包时它回
+                    # "cpu"，这时什么都不用做。只有确实在 GPU 上建了会话才检查。
+                    if active != "cpu" and not self._gpu_checked:
+                        # 部分驱动/运行时组合会让 DirectML 建会话时正常、一跑推理就把
+                        # 进程整个带走（连 except 都抓不到），那种机器上每帧都崩。
+                        # 用一张纯色图试跑一次，失败就退回 CPU。
+                        self._gpu_checked = True
+                        if not self._gpu_healthy():
+                            self._fallback_to_cpu("GPU 首次推理失败")
+                    else:
+                        providers = session_providers(self._engine)
+                        if providers and providers[0] != "CPUExecutionProvider":
+                            self.gpu_note = ("OCR 使用 "
+                                             f"{_GPU_NAMES.get(providers[0], providers[0])} 后端")
         return self._engine
+
+    def _gpu_healthy(self) -> bool:
+        """用一张最小的纯色图试跑一次，确认 GPU 会话真能推理。"""
+        try:
+            probe = np.full((64, 64, 3), 127, np.uint8)
+            self._engine(probe)
+            return True
+        except Exception:
+            return False
+
+    def _fallback_to_cpu(self, reason: str) -> None:
+        """GPU 不可靠：把会话工厂还回 CPU 并丢掉已建好的引擎，下次自动重建。"""
+        try:
+            apply_provider("cpu")
+        except Exception:
+            pass
+        self._engine = None
+        self.provider = "cpu"
+        self.gpu_note = ""
+        self.cap_note = ((self.cap_note + "；") if self.cap_note else "") + (
+            reason + "，已自动退回 CPU")
 
     def recognize(self, frame_bgr: np.ndarray, max_side: int = DEFAULT_MAX_SIDE,
                   min_side: int = DEFAULT_MIN_SIDE) -> list[OcrHit]:

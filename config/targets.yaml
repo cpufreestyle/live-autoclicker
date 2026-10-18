@@ -8,7 +8,7 @@ targets:
   - 0
   - 0
   cooldown_sec: 30.0
-  enabled: true
+  enabled: false
   match_threshold: null
   monitors: []
 - name: 奖券
@@ -37,3 +37,16 @@ targets:
   enabled: true
   match_threshold: null
   monitors: []
+- name: 签到·测试窗口
+  template: ''
+  ocr_keywords:
+  - 签到
+  - 立即签到
+  click_offset:
+  - 0
+  - 0
+  cooldown_sec: 30.0
+  enabled: true
+  match_threshold: null
+  monitors:
+  - 测试窗口
