@@ -347,6 +347,8 @@ class MainWindow:
         self._section(box, "扫描节奏")
         self._scale_row(box, "scan_interval_sec", "扫描间隔", 0.2, 30.0, 1, lambda v: f"{v:g}s")
         self._scale_row(box, "jitter_sec", "随机抖动", 0.0, 5.0, 1, lambda v: f"{v:g}s")
+        self._scale_row(box, "fast_interval_sec", "模板快速", 0.0, 5.0, 2,
+                         lambda v: "关" if v <= 0 else f"{v*1000:.0f}ms")
 
         self._section(box, "识别")
         self._scale_row(box, "match_threshold", "匹配阈值", 0.5, 1.0, 2, lambda v: f"{v:.2f}")
@@ -498,6 +500,7 @@ class MainWindow:
     def _load_settings_to_vars(self) -> None:
         self.vars["scan_interval_sec"].set(self.settings.scan_interval_sec)
         self.vars["jitter_sec"].set(self.settings.jitter_sec)
+        self.vars["fast_interval_sec"].set(getattr(self.settings, "fast_interval_sec", 0.0))
         self.vars["match_threshold"].set(self.settings.match_threshold)
         self.vars["ocr_min_score"].set(self.settings.ocr_min_score)
         self.vars["highlight_sec"].set(self.settings.highlight_sec)
@@ -779,6 +782,7 @@ class MainWindow:
         self._apply_job = None
         self.settings.scan_interval_sec = max(0.2, self._snap("scan_interval_sec"))
         self.settings.jitter_sec = max(0.0, self._snap("jitter_sec"))
+        self.settings.fast_interval_sec = max(0.0, self._snap("fast_interval_sec"))
         self.settings.match_threshold = min(1.0, max(0.3, self._snap("match_threshold")))
         self.settings.ocr_min_score = min(1.0, max(0.1, self._snap("ocr_min_score")))
         self.settings.highlight_sec = self._snap("highlight_sec")

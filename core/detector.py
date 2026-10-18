@@ -260,6 +260,7 @@ class Detector:
     def scan(self, frame, targets: list[Target],
              region: tuple[int, int, int, int] | None = None,
              run_ocr: bool = True,
+             templates_only: bool = False,
              note_near_miss: bool = False) -> list[Detection]:
         """返回本帧所有「可点击」命中（已去重并排除冷却中的目标）。
 
@@ -275,6 +276,11 @@ class Detector:
         # 冷却中的目标这轮点不了，先挑掉：只剩冷却目标时整帧 OCR 是白跑
         ready = [t for t in self.targets_for(targets)
                  if self.cooldowns.ready(self.monitor.name, t)]
+        if templates_only:
+            # Template fast tick: targets without a template are not
+            # looked at this frame at all; OCR-only targets still get
+            # their own (slower) round, so nothing is missed.
+            ready = [t for t in ready if t.template]
         candidates: dict[str, list[tuple[MatchResult, str]]] = {}
 
         ocr_hits: list[OcrHit] | None = None

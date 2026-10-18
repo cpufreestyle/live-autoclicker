@@ -109,6 +109,9 @@ class MonitorWorker(threading.Thread):
         self._moved: list[tuple[int, int, int]] = []
         self._raised_hwnd = 0
         self.ocr_due = True
+        # 快档：模板匹配单独跑一个更快的节奏（15ms/帧），OCR 仍按自己的节拍走
+        self._fast_interval = self._resolve_fast_interval()
+        self._last_fast_at = 0.0
 
     def run(self) -> None:
         try:
@@ -137,6 +140,13 @@ class MonitorWorker(threading.Thread):
                 self._cooling = False
                 self._round += 1
                 self.ocr_due = self._ocr_due_this_round()
+                # 快档：这一帧只该跑模板时，OCR 一定不跑。模板 15ms、OCR 1s，
+                # 两条通道绑一个间隔的话，配了模板的目标也只能等 OCR 那 1 秒。
+                fast_only = (self._fast_interval > 0
+                             and not self.ocr_due
+                             and time.monotonic() - self._last_fast_at >= self._fast_interval)
+                if fast_only:
+                    self._last_fast_at = time.monotonic()
                 # 体检要在这一帧的 process_frame 之前把开关立起来，否则相似度算不出来
                 if self.state.scans % PROGRESS_EVERY == 0:
                     self._progress_due = True
@@ -160,7 +170,7 @@ class MonitorWorker(threading.Thread):
                             # 「刚点完要补一次识别」只在这一刻用掉：上面整轮跳过的
                             # 情况不许消耗它，否则弹窗没被点掉时就少了一次确认的机会
                             self._ocr_force = False
-                            self.engine.process_frame(self, frame)
+                            self.engine.process_frame(self, frame, fast_only=fast_only)
                             self.state.last_error = ""
                 except Exception as exc:
                     self.state.last_error = str(exc)[:120]
@@ -335,6 +345,18 @@ class MonitorWorker(threading.Thread):
         if not point_on_screen(cx, cy):
             return True
         return not point_owned_by_session(hwnd, cx, cy)
+
+    def _resolve_fast_interval(self) -> float:
+        """模板通道的轮询间隔；关掉快档时返回 0。
+
+        关掉的条件：配了 0/负数，或者比慢档还大（那等于没开）。此时模板和 OCR
+        绑在同一个节奏上，行为和加这个参数之前完全一致。
+        """
+        fast = float(getattr(self.engine.settings, "fast_interval_sec", 0.0) or 0.0)
+        if fast <= 0:
+            return 0.0
+        slow = self.monitor.interval(self.engine.settings)
+        return fast if fast < slow else 0.0
 
     def _next_pause(self) -> float:
         settings = self.engine.settings
@@ -679,10 +701,15 @@ class Engine:
         self.click_guard.reset(monitor_name)
 
     # ---------- 扫描结果处理 ----------
-    def process_frame(self, worker: MonitorWorker, frame) -> None:
-        worker.detector.settings = self.settings  # 参数热更新对已运行的窗口同样生效
+    def process_frame(self, worker: MonitorWorker, frame,
+                       fast_only: bool = False) -> None:
+        # fast_only=True means this frame is a template-only fast tick: OCR is
+        # never run here, so template targets get clicked ~15ms after they show
+        # up instead of waiting for the 1s OCR pass.
+        worker.detector.settings = self.settings
         detections = worker.detector.scan(frame, self.targets, region=worker.region,
-                                         run_ocr=worker.ocr_due,
+                                         run_ocr=worker.ocr_due and not fast_only,
+                                         templates_only=fast_only,
                                          note_near_miss=worker._progress_due)
         if worker.detector.last_ocr_hits:
             worker._ocr_runs += 1

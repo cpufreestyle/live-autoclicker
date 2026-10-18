@@ -111,6 +111,12 @@ class Settings:
     """全局运行参数（每个监控窗口共享）。"""
     scan_interval_sec: float = 1.5
     jitter_sec: float = 0.6
+    # 模板通道的轮询间隔。模板匹配实测 15ms/帧，OCR 要 1s/帧——原来两条通道
+    # 绑在同一个间隔上，配了模板的目标也只能等 OCR 那 1 秒。现在分开：
+    # 模板每 fast_interval_sec 扫一次（有模板的目标几乎立刻点到），
+    # OCR 仍按 ocr_scan_every / ocr_idle_every 降频，绝不被模板拖快。
+    # 填 0 或比 scan_interval_sec 大 = 关掉快档，回到「两条通道同一节奏」。
+    fast_interval_sec: float = 0.1
     match_threshold: float = 0.85
     ocr_min_score: float = 0.5
     ocr_max_side: int = 1600      # OCR 前把帧最长边压到该值，4K 整屏必需
@@ -146,6 +152,7 @@ class Settings:
 # 但 0.0 的扫描间隔或 999 的并发会把引擎直接拖死。
 _SETTINGS_BOUNDS: dict[str, tuple[float, float]] = {
     "scan_interval_sec": (0.2, 60.0),
+    "fast_interval_sec": (0.0, 60.0),
     "jitter_sec": (0.0, 30.0),
     "match_threshold": (0.3, 1.0),
     "ocr_min_score": (0.0, 1.0),

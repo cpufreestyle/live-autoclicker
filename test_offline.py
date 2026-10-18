@@ -1854,6 +1854,63 @@ def test_sane_geometry_clamps_and_rejects() -> None:
         assert sane_geometry(bad, 1920, 1080, 700, 420) is None, bad
 
 
+def test_template_fast_tick_skips_ocr_only_targets() -> None:
+    # A fast tick (templates_only=True) must still find template targets and must
+    # never look at keyword-only targets, so the 15ms template pass can run far
+    # more often than the 1s OCR pass without missing anything.
+    import cv2
+    import numpy as np
+
+    targets = [Target("tmpl", template="templates/ljsq_button.png"),
+               Target("kw", ocr_keywords=["X"])]
+    settings = Settings(fast_interval_sec=0.1)
+
+    frame = np.random.default_rng(3).integers(20, 90, (725, 609, 3), dtype=np.uint8)
+    tmpl = cv2.imread(abs_path("templates/ljsq_button.png"))
+    th, tw = tmpl.shape[:2]
+    frame[300:300 + th, 180:180 + tw] = tmpl
+
+    det = Detector(settings, Monitor("w", [0, 0, 609, 725]))
+    det.targets = targets
+    det.ocr = None          # fast frames must not need OCR at all
+
+    hits = det.scan(frame, targets, region=(0, 0, 609, 725),
+                    run_ocr=False, templates_only=True)
+    names = sorted(d.target_name for d in hits)
+    assert "tmpl" in names, f"template target must be found on a fast frame: {names}"
+    assert "kw" not in names, f"keyword-only target must be skipped: {names}"
+
+    # The slow path is unchanged: same frame, no fast flag.
+    det2 = Detector(settings, Monitor("w", [0, 0, 609, 725]))
+    det2.targets = targets
+    det2.ocr = None
+    slow = sorted(d.target_name for d in det2.scan(
+        frame, targets, region=(0, 0, 609, 725), run_ocr=False, templates_only=False))
+    assert "tmpl" in slow, slow
+
+
+def test_fast_interval_disabled_when_not_faster_than_slow() -> None:
+    # fast_interval_sec of 0 (or larger than the scan interval) means the fast
+    # tick is off and both channels share one cadence again.
+    import types
+    from core import engine as engine_mod
+
+    settings = Settings(fast_interval_sec=0.0)
+    monitor = Monitor("w", [0, 0, 100, 100])
+    worker = object.__new__(engine_mod.MonitorWorker)
+    worker.engine = types.SimpleNamespace(settings=settings)
+    worker.monitor = monitor
+    assert worker._resolve_fast_interval() == 0.0
+
+    settings = Settings(fast_interval_sec=5.0)
+    worker.engine = types.SimpleNamespace(settings=settings)
+    assert worker._resolve_fast_interval() == 0.0
+
+    settings = Settings(fast_interval_sec=0.1)
+    worker.engine = types.SimpleNamespace(settings=settings)
+    assert worker._resolve_fast_interval() == 0.1
+
+
 def main() -> int:
     tests = [test_merged_keyword_box, test_keyword_box_boundaries, test_config_coercion,
              test_template_errors_reported_once, test_abs_path_resolution,
@@ -1882,7 +1939,9 @@ def main() -> int:
              test_stop_is_non_blocking_and_does_not_duplicate_workers,
              test_click_skipped_when_window_closed_during_scan,
              test_build_script_is_ascii_and_strips_bad_crt,
-             test_ui_state_round_trip, test_sane_geometry_clamps_and_rejects]
+             test_ui_state_round_trip, test_sane_geometry_clamps_and_rejects,
+             test_template_fast_tick_skips_ocr_only_targets,
+             test_fast_interval_disabled_when_not_faster_than_slow]
     for test in tests:
         test()
         print(f"OK  {test.__name__}")
